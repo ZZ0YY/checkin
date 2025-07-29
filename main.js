@@ -1,11 +1,55 @@
+// --- 常量定义 ---
+// 将固定的 URL 和配置放在这里，方便管理
+const GITHUB_ACTION_LINK = `<${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`;
+const GLADOS_API = {
+  CHECKIN: 'https://glados.rocks/api/user/checkin',
+  STATUS: 'https://glados.rocks/api/user/status',
+  REFERER: 'https://glados.rocks/console/checkin'
+};
+const NOTIFY_API = {
+  WXPUSHER: 'https://wxpusher.zjiecode.com/api/send/message',
+  PUSHPLUS: 'https://www.pushplus.plus/send',
+  QYWEIXIN: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key='
+};
+
+/**
+ * 带有超时功能的 fetch 封装
+ * @param {string} url 请求 URL
+ * @param {object} options fetch 的配置选项
+ * @param {number} timeout 超时时间 (毫秒)
+ * @returns {Promise<Response>}
+ */
+const fetchWithTimeout = async (url, options, timeout = 8000) => {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+    return response;
+  } catch (error) {
+    if (error.name === 'AbortError') {
+      throw new Error(`Request to ${url} timed out after ${timeout / 1000} seconds`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+
+/**
+ * GLaDOS 签到函数
+ * @returns {Promise<string|null>} 组合好的通知字符串，如果没有配置则返回 null
+ */
 const glados = async () => {
-  // 检查 GLADOS 环境变量是否存在
   if (!process.env.GLADOS) {
     console.log('GLADOS secret not found, skipping checkin.');
-    return null; // 如果没有配置，直接返回 null
+    return null;
   }
 
-  // 将环境变量中的 cookies 按行分割成数组
   const cookies = String(process.env.GLADOS).split('\n').filter(cookie => cookie.trim() !== '');
   if (cookies.length === 0) {
     console.log('GLADOS secret is empty, skipping checkin.');
@@ -14,149 +58,125 @@ const glados = async () => {
 
   const notices = [];
 
-  // 遍历所有 cookies 进行签到
   for (const [index, cookie] of cookies.entries()) {
-    // 默认账户标识，用于出错时
     let accountIdentifier = `Account #${index + 1}`;
-    let notice_body = [];
+    const notice_body = [];
 
     try {
       const common_headers = {
         'cookie': cookie,
-        'referer': 'https://glados.rocks/console/checkin',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        'referer': GLADOS_API.REFERER,
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
       };
 
       // 1. 执行签到
-      const checkin_response = await fetch('https://glados.rocks/api/user/checkin', {
+      const checkin_response = await fetchWithTimeout(GLADOS_API.CHECKIN, {
         method: 'POST',
         headers: { ...common_headers, 'content-type': 'application/json' },
         body: JSON.stringify({ token: 'glados.one' }),
       });
+      if (!checkin_response.ok) {
+        throw new Error(`Checkin API returned status ${checkin_response.status} ${checkin_response.statusText}`);
+      }
       const checkin_result = await checkin_response.json();
-      
+
       // 2. 获取账户状态
-      const status_response = await fetch('https://glados.rocks/api/user/status', {
+      const status_response = await fetchWithTimeout(GLADOS_API.STATUS, {
         method: 'GET',
         headers: common_headers,
       });
+      if (!status_response.ok) {
+        throw new Error(`Status API returned status ${status_response.status} ${status_response.statusText}`);
+      }
       const status_result = await status_response.json();
 
-      // 从 status API 的返回结果中获取 email 作为账户标识
       if (status_result?.data?.email) {
         accountIdentifier = status_result.data.email;
       }
-      
-      // 检查签到和状态API的返回码
+
       if (checkin_result?.code === -2) {
-        // -2 通常表示已经签到过
-        notice_body.push(
-          `✅ Checkin Already Done`,
-          `💬 Message: ${checkin_result.message}`,
-          `⏳ Left Days: ${Number(status_result?.data?.leftDays)}`
-        );
+        notice_body.push(`✅ Checkin Already Done`, `💬 Message: ${checkin_result.message}`, `⏳ Left Days: ${Number(status_result?.data?.leftDays)}`);
       } else if (checkin_result?.code === 0) {
-        // 0 表示签到成功
-        notice_body.push(
-          `✅ Checkin OK`,
-          `💬 Message: ${checkin_result.message}`,
-          `⏳ Left Days: ${Number(status_result?.data?.leftDays)}`
-        );
+        notice_body.push(`✅ Checkin OK`, `💬 Message: ${checkin_result.message}`, `⏳ Left Days: ${Number(status_result?.data?.leftDays)}`);
       } else {
-        // 其他 code 表示签到失败
-        throw new Error(checkin_result.message || 'Unknown checkin error');
+        throw new Error(checkin_result.message || 'Unknown checkin error from API');
       }
 
     } catch (error) {
-      notice_body.push(
-        `❌ Checkin Error`,
-        `💬 Reason: ${error.message}`,
-        `🔗 Link: <${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`
-      );
+      console.error(`[${accountIdentifier}] Checkin process failed:`, error);
+      notice_body.push(`❌ Checkin Error`, `💬 Reason: ${error.message}`, `🔗 Link: ${GITHUB_ACTION_LINK}`);
     }
-    
-    // 将当前账户的通知内容组合起来
+
     notices.push(`[${accountIdentifier}]\n` + notice_body.join('\n'));
   }
-  
-  // 将所有账户的通知用分隔符连接起来
+
   return notices.join('\n\n---\n\n');
 };
 
+/**
+ * 发送通知
+ * @param {string} notice 要发送的通知内容
+ */
 const notify = async (notice) => {
   if (!process.env.NOTIFY || !notice) return;
 
-  for (const option of String(process.env.NOTIFY).split('\n')) {
-    if (!option) continue;
+  const notifyOptions = String(process.env.NOTIFY).split('\n').filter(opt => opt.trim() !== '');
+
+  for (const option of notifyOptions) {
     try {
       if (option.startsWith('console:')) {
-        console.log("--- Notification ---");
-        console.log(notice);
-        console.log("--- End Notification ---");
+        console.log("--- Notification ---\n", notice, "\n--- End Notification ---");
       } else if (option.startsWith('wxpusher:')) {
-        const parts = option.split(':');
-        const appToken = parts[1];
-        const uids = parts.slice(2);
-        await fetch(`https://wxpusher.zjiecode.com/api/send/message`, {
+        const [, appToken, ...uids] = option.split(':');
+        await fetchWithTimeout(NOTIFY_API.WXPUSHER, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            appToken,
-            content: notice,
-            summary: `GLaDOS Checkin Report`,
-            contentType: 1, // 1 for text, 2 for html, 3 for markdown
-            uids,
-          }),
+          body: JSON.stringify({ appToken, content: notice, summary: `GLaDOS Checkin Report`, contentType: 1, uids }),
         });
       } else if (option.startsWith('pushplus:')) {
-        await fetch(`https://www.pushplus.plus/send`, {
+        const [, token] = option.split(':');
+        await fetchWithTimeout(NOTIFY_API.PUSHPLUS, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            token: option.split(':')[1],
-            title: `GLaDOS Checkin Report`,
-            content: notice.replace(/\n/g, '<br>'), // pushplus uses <br> for newlines in markdown
-            template: 'markdown',
-          }),
+          body: JSON.stringify({ token, title: `GLaDOS Checkin Report`, content: notice.replace(/\n/g, '<br>'), template: 'markdown' }),
         });
       } else if (option.startsWith('qyweixin:')) {
-        const qyweixinToken = option.split(':')[1];
-        const qyweixinNotifyRebotUrl = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=' + qyweixinToken;
-        await fetch(qyweixinNotifyRebotUrl, {
+        const [, token] = option.split(':');
+        await fetchWithTimeout(NOTIFY_API.QYWEIXIN + token, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            msgtype: 'markdown',
-            markdown: {
-                content: notice,
-            },
-          }),
+          body: JSON.stringify({ msgtype: 'markdown', markdown: { content: notice } }),
         });
-      } else {
-        // Fallback to pushplus if no prefix
-        await fetch(`https://www.pushplus.plus/send`, {
+      } else { // 默认为 pushplus
+        await fetchWithTimeout(NOTIFY_API.PUSHPLUS, {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            token: option,
-            title: `GLaDOS Checkin Report`,
-            content: notice.replace(/\n/g, '<br>'),
-            template: 'markdown',
-          }),
+          body: JSON.stringify({ token: option, title: `GLaDOS Checkin Report`, content: notice.replace(/\n/g, '<br>'), template: 'markdown' }),
         });
       }
     } catch (error) {
-      console.error(`Notify Error for option: ${option}`, error);
+      console.error(`Notify Error for option: ${option.split(':')[0]}`, error);
     }
   }
 };
 
+/**
+ * 主执行函数
+ */
 const main = async () => {
-  const notice_content = await glados();
-  if (notice_content) {
-    await notify(notice_content);
-  } else {
-    console.log("No notice content to send.");
+  try {
+    const notice_content = await glados();
+    if (notice_content) {
+      await notify(notice_content);
+    } else {
+      console.log("No notice content generated or no accounts configured. Exiting.");
+    }
+  } catch (error) {
+    console.error("A critical error occurred in the main process:", error);
+    // 当发生严重错误时，也尝试发送通知
+    const errorMessage = `🚨 **GLaDOS Action Critical Error**\n\nAn unexpected error caused the script to fail:\n\n**Message:**\n${error.message}\n\n**Check Action Log for details:**\n${GITHUB_ACTION_LINK}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+    await notify(errorMessage);
+    process.exit(1); // 以失败状态码退出，明确标识 Action 失败
   }
 };
 
