@@ -1,6 +1,5 @@
 // --- 常量定义 ---
-// 将固定的 URL 和配置放在这里，方便管理
-const GITHUB_ACTION_LINK = `<${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>`;
+const GITHUB_ACTION_LINK = `<${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}>/actions/runs/${process.env.GITHUB_RUN_ID}`;
 const GLADOS_API = {
   CHECKIN: 'https://glados.rocks/api/user/checkin',
   STATUS: 'https://glados.rocks/api/user/status',
@@ -11,6 +10,7 @@ const NOTIFY_API = {
   PUSHPLUS: 'https://www.pushplus.plus/send',
   QYWEIXIN: 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key='
 };
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36';
 
 /**
  * 带有超时功能的 fetch 封装
@@ -24,21 +24,15 @@ const fetchWithTimeout = async (url, options, timeout = 8000) => {
   const timeoutId = setTimeout(() => controller.abort(), timeout);
 
   try {
-    const response = await fetch(url, {
-      ...options,
-      signal: controller.signal
-    });
+    const response = await fetch(url, { ...options, signal: controller.signal });
     return response;
   } catch (error) {
-    if (error.name === 'AbortError') {
-      throw new Error(`Request to ${url} timed out after ${timeout / 1000} seconds`);
-    }
+    if (error.name === 'AbortError') throw new Error(`Request to ${url} timed out after ${timeout / 1000} seconds`);
     throw error;
   } finally {
     clearTimeout(timeoutId);
   }
 };
-
 
 /**
  * GLaDOS 签到函数
@@ -49,57 +43,71 @@ const glados = async () => {
     console.log('GLADOS secret not found, skipping checkin.');
     return null;
   }
+  
+  let accounts;
+  try {
+    // 优先尝试解析 JSON 格式，以支持 Authorization
+    accounts = JSON.parse(process.env.GLADOS);
+    if (!Array.isArray(accounts)) throw new Error("GLADOS secret is not a JSON Array.");
+  } catch (e) {
+      console.log("Could not parse GLADOS secret as JSON, falling back to legacy string format.");
+      // 为了向后兼容，如果 JSON 解析失败，则回退到旧的纯文本格式
+      accounts = String(process.env.GLADOS).split('\n').filter(cookie => cookie.trim() !== '').map(cookie => ({cookie: cookie, authorization: null}));
+  }
 
-  const cookies = String(process.env.GLADOS).split('\n').filter(cookie => cookie.trim() !== '');
-  if (cookies.length === 0) {
-    console.log('GLADOS secret is empty, skipping checkin.');
+  if (accounts.length === 0) {
+    console.log('No accounts configured in GLADOS secret, skipping checkin.');
     return null;
   }
 
   const notices = [];
 
-  for (const [index, cookie] of cookies.entries()) {
+  for (const [index, account] of accounts.entries()) {
     let accountIdentifier = `Account #${index + 1}`;
     const notice_body = [];
 
     try {
-      const common_headers = {
-        'cookie': cookie,
+      // 构造请求头，优先使用 account 对象中的值
+      const headers = {
+        'cookie': account.cookie,
         'referer': GLADOS_API.REFERER,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36'
+        'user-agent': USER_AGENT,
+        'authorization': account.authorization || null, // 如果 authorization 不存在，则为 null
       };
 
       // 1. 执行签到
       const checkin_response = await fetchWithTimeout(GLADOS_API.CHECKIN, {
         method: 'POST',
-        headers: { ...common_headers, 'content-type': 'application/json' },
+        headers: { ...headers, 'content-type': 'application/json' },
         body: JSON.stringify({ token: 'glados.one' }),
       });
-      if (!checkin_response.ok) {
-        throw new Error(`Checkin API returned status ${checkin_response.status} ${checkin_response.statusText}`);
-      }
+      if (!checkin_response.ok) throw new Error(`Checkin API Error: ${checkin_response.status} ${checkin_response.statusText}`);
       const checkin_result = await checkin_response.json();
-
+      
       // 2. 获取账户状态
-      const status_response = await fetchWithTimeout(GLADOS_API.STATUS, {
-        method: 'GET',
-        headers: common_headers,
-      });
-      if (!status_response.ok) {
-        throw new Error(`Status API returned status ${status_response.status} ${status_response.statusText}`);
-      }
+      const status_response = await fetchWithTimeout(GLADOS_API.STATUS, { method: 'GET', headers });
+      if (!status_response.ok) throw new Error(`Status API Error: ${status_response.status} ${status_response.statusText}`);
       const status_result = await status_response.json();
 
+      // 使用 email 作为更友好的账户标识
       if (status_result?.data?.email) {
         accountIdentifier = status_result.data.email;
       }
-
-      if (checkin_result?.code === -2) {
-        notice_body.push(`✅ Checkin Already Done`, `💬 Message: ${checkin_result.message}`, `⏳ Left Days: ${Number(status_result?.data?.leftDays)}`);
-      } else if (checkin_result?.code === 0) {
-        notice_body.push(`✅ Checkin OK`, `💬 Message: ${checkin_result.message}`, `⏳ Left Days: ${Number(status_result?.data?.leftDays)}`);
+      
+      // -- 解析签到结果 --
+      // code: 0=成功, 1=重复, -2=旧的重复代码
+      if (checkin_result.code === 0) {
+          const points = checkin_result.list?.[0]?.change || 'N/A';
+          notice_body.push(`✅ Checkin OK`, `💬 Message: ${checkin_result.message}`, `🎁 Points: +${points}`);
+      } else if (checkin_result.code === 1 || checkin_result.code === -2) {
+          notice_body.push(`✅ ${checkin_result.message}`);
       } else {
-        throw new Error(checkin_result.message || 'Unknown checkin error from API');
+          throw new Error(checkin_result.message || 'Unknown checkin error from API');
+      }
+
+      // -- 添加剩余天数信息 --
+      if (status_result?.data?.leftDays) {
+        notice_body.push(`⏳ Left Days: ${Number(status_result.data.leftDays)}`);
       }
 
     } catch (error) {
@@ -114,50 +122,43 @@ const glados = async () => {
 };
 
 /**
- * 发送通知
- * @param {string} notice 要发送的通知内容
+ * 发送通知函数 (此函数无需修改)
  */
 const notify = async (notice) => {
-  if (!process.env.NOTIFY || !notice) return;
-
-  const notifyOptions = String(process.env.NOTIFY).split('\n').filter(opt => opt.trim() !== '');
-
-  for (const option of notifyOptions) {
-    try {
-      if (option.startsWith('console:')) {
-        console.log("--- Notification ---\n", notice, "\n--- End Notification ---");
-      } else if (option.startsWith('wxpusher:')) {
-        const [, appToken, ...uids] = option.split(':');
-        await fetchWithTimeout(NOTIFY_API.WXPUSHER, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ appToken, content: notice, summary: `GLaDOS Checkin Report`, contentType: 1, uids }),
-        });
-      } else if (option.startsWith('pushplus:')) {
-        const [, token] = option.split(':');
-        await fetchWithTimeout(NOTIFY_API.PUSHPLUS, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ token, title: `GLaDOS Checkin Report`, content: notice.replace(/\n/g, '<br>'), template: 'markdown' }),
-        });
-      } else if (option.startsWith('qyweixin:')) {
-        const [, token] = option.split(':');
-        await fetchWithTimeout(NOTIFY_API.QYWEIXIN + token, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ msgtype: 'markdown', markdown: { content: notice } }),
-        });
-      } else { // 默认为 pushplus
-        await fetchWithTimeout(NOTIFY_API.PUSHPLUS, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ token: option, title: `GLaDOS Checkin Report`, content: notice.replace(/\n/g, '<br>'), template: 'markdown' }),
-        });
-      }
-    } catch (error) {
-      console.error(`Notify Error for option: ${option.split(':')[0]}`, error);
+    if (!process.env.NOTIFY || !notice) return;
+    const notifyOptions = String(process.env.NOTIFY).split('\n').filter(opt => opt.trim() !== '');
+    for (const option of notifyOptions) {
+        try {
+            if (option.startsWith('console:')) {
+                console.log("--- Notification ---\n", notice, "\n--- End Notification ---");
+            } else if (option.startsWith('wxpusher:')) {
+                const [, appToken, ...uids] = option.split(':');
+                await fetchWithTimeout(NOTIFY_API.WXPUSHER, {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ appToken, content: notice, summary: `GLaDOS Checkin Report`, contentType: 1, uids }),
+                });
+            } else if (option.startsWith('pushplus:')) {
+                const [, token] = option.split(':');
+                await fetchWithTimeout(NOTIFY_API.PUSHPLUS, {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ token, title: `GLaDOS Checkin Report`, content: notice.replace(/\n/g, '<br>'), template: 'markdown' }),
+                });
+            } else if (option.startsWith('qyweixin:')) {
+                const [, token] = option.split(':');
+                await fetchWithTimeout(NOTIFY_API.QYWEIXIN + token, {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ msgtype: 'markdown', markdown: { content: notice } }),
+                });
+            } else { // 默认为 pushplus
+                await fetchWithTimeout(NOTIFY_API.PUSHPLUS, {
+                    method: 'POST', headers: { 'content-type': 'application/json' },
+                    body: JSON.stringify({ token: option, title: `GLaDOS Checkin Report`, content: notice.replace(/\n/g, '<br>'), template: 'markdown' }),
+                });
+            }
+        } catch (error) {
+            console.error(`Notify Error for option: ${option.split(':')[0]}`, error);
+        }
     }
-  }
 };
 
 /**
@@ -173,10 +174,9 @@ const main = async () => {
     }
   } catch (error) {
     console.error("A critical error occurred in the main process:", error);
-    // 当发生严重错误时，也尝试发送通知
-    const errorMessage = `🚨 **GLaDOS Action Critical Error**\n\nAn unexpected error caused the script to fail:\n\n**Message:**\n${error.message}\n\n**Check Action Log for details:**\n${GITHUB_ACTION_LINK}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+    const errorMessage = `🚨 **GLaDOS Action Critical Error**\n\nAn unexpected error caused the script to fail:\n\n**Message:**\n${error.message}\n\n**Check Action Log for details:**\n${GITHUB_ACTION_LINK}`;
     await notify(errorMessage);
-    process.exit(1); // 以失败状态码退出，明确标识 Action 失败
+    process.exit(1);
   }
 };
 
