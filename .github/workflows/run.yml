@@ -5,6 +5,7 @@ on:
   push:
   schedule:
     - cron: 5 15 * * *
+    - cron: 14 13 * * * # 每天晚上 21:14 北京时间
 
 jobs:
   run:
